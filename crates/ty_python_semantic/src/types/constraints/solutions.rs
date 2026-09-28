@@ -515,7 +515,7 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
     }
 
     #[expect(clippy::too_many_arguments)]
-    fn visit_constraint<B, R: FoldedSolutions<'db, L>>(
+    fn visit_constraint<B: From<L::Break>, R: FoldedSolutions<'db, L>>(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -539,10 +539,16 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 AtomicConstraintId(constraint_id),
                 process_node,
             ),
-            Constraint::Existential(_) => {
-                // XXX
-                ControlFlow::Continue(R::default())
-            }
+            Constraint::Existential(existential) => self.visit_existential_constraint(
+                db,
+                env,
+                storage,
+                path,
+                polarity,
+                interior,
+                existential.body,
+                process_node,
+            ),
         }
     }
 
@@ -655,6 +661,138 @@ impl<'db, L: SolutionLimits> SolutionWalker<'db, L> {
                 process_node(self, storage, path, polarity, child)
             },
         )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn visit_node_and_then<B: From<L::Break>, R: FoldedSolutions<'db, L>>(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        storage: &mut ConstraintSetStorage<'db>,
+        path: &mut PathAssignments,
+        polarity: Polarity,
+        node: NodeId,
+        process_satisfied: &ProcessSatisfied<'_, 'db, L, B, R>,
+    ) -> ControlFlow<B, R> {
+        self.limits.visit_node().map_break(B::from)?;
+        match (polarity, node) {
+            (Polarity::Positive, ALWAYS_FALSE) | (Polarity::Negative, ALWAYS_TRUE) => {
+                ControlFlow::Continue(R::default())
+            }
+            (Polarity::Positive, ALWAYS_TRUE) | (Polarity::Negative, ALWAYS_FALSE) => {
+                process_satisfied(self, storage, path)
+            }
+            _ => self.visit_constraint(
+                db,
+                env,
+                storage,
+                path,
+                polarity,
+                node,
+                &|this, storage, path, polarity, child| {
+                    this.visit_node_and_then(
+                        db, env, storage, path, polarity, child, process_satisfied,
+                    )
+                },
+            ),
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn visit_existential_constraint<B: From<L::Break>, R: FoldedSolutions<'db, L>>(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        storage: &mut ConstraintSetStorage<'db>,
+        path: &mut PathAssignments,
+        polarity: Polarity,
+        interior: InteriorNodeData,
+        existential_body: NodeId,
+        process_node: &ProcessNode<'_, 'db, L, B, R>,
+    ) -> ControlFlow<B, R> {
+        let (if_holds, if_not_holds) = match polarity {
+            Polarity::Positive => (interior.if_true, interior.if_false),
+            Polarity::Negative => (
+                interior.if_true.or(storage, interior.if_uncertain),
+                interior.if_false.or(storage, interior.if_uncertain),
+            ),
+        };
+
+        // Walk the outgoing edge that depends on the existential holding. If we find any candidate
+        // solutions, walk the existential's body to make sure there are valid existential
+        // solutions that are compatible with that candidate solution.
+        let mut result = self.visit_node_and_then(
+            db,
+            env,
+            storage,
+            path,
+            polarity,
+            if_holds,
+            &|this, storage, path| {
+                // Note that we never negate existential's body, even when we are walking the
+                // negation of the existential _node_.
+                process_node(
+                    this,
+                    storage,
+                    path,
+                    Polarity::Positive,
+                    existential_body,
+                )
+            },
+        )?;
+        if result.is_saturated(self) {
+            return ControlFlow::Continue(result);
+        }
+
+        // Under positive polarity, the existential's `if_uncertain` edge holds regardless of
+        // whether the quantifier itself holds, so we don't need to check the body.
+        if polarity == Polarity::Positive {
+            let when_uncertain = process_node(
+                self,
+                storage,
+                path,
+                polarity,
+                interior.if_uncertain,
+            )?;
+            result = R::combine(self, &result, &when_uncertain);
+            if result.is_saturated(self) {
+                return ControlFlow::Continue(result);
+            }
+        }
+
+        // Last, walk the outgoing edge that depends on the existential _not_ holding. For each
+        // candidate solution, we check whether the existential's body has any solutions _given
+        // that candidate solution_.
+        let when_false = self.visit_node_and_then(
+            db,
+            env,
+            storage,
+            path,
+            polarity,
+            if_not_holds,
+            &|this, storage, path| {
+                // Note that we never negate existential's body, even when we are walking the
+                // negation of the existential _node_.
+                let has_any_solutions = this
+                    .node_is_satisfiable_on_path(
+                        db,
+                        env,
+                        storage,
+                        path,
+                        Polarity::Positive,
+                        existential_body,
+                        None,
+                    )
+                    .map_break(B::from)?;
+                if has_any_solutions {
+                    // Conservatively reject this candidate solution if the existential has at
+                    // least one solution.
+                    return ControlFlow::Continue(R::default());
+                }
+                process_node(this, storage, path, Polarity::Positive, ALWAYS_TRUE)
+            },
+        )?;
+        ControlFlow::Continue(R::combine(self, &result, &when_false))
     }
 
     fn with_declared_constraint_solution<R>(
