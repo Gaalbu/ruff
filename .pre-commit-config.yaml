@@ -118,11 +118,16 @@ repos:
         priority: 0
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: a1785f8e81fe9936d828bef574e6db07e8c8c374 # frozen: 0.12.23
+    rev: 2e145a365871c9fef3715d38b9b7393ce4174c85 # frozen: 0.13.0
     hooks:
       - id: uv-lock
         priority: 0
-        args: [--default-index=https://pypi.org/simple, --check, --refresh]
+        args:
+          [
+            --default-index=https://pypi.org/simple,
+            --check,
+            --refresh,
+          ]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: f12be1ebaa5351c1fc76472de98db2c3446c8253 # frozen: v0.16.10
