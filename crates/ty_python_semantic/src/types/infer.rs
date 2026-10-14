@@ -521,7 +521,10 @@ pub(crate) fn reaching_definitions_for_scope<'db>(
 }
 
 /// Returns the scope that supplies the type context needed to infer `scope`.
-fn scope_for_complete_type_inference<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> ScopeId<'db> {
+pub(crate) fn scope_for_complete_type_inference<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+) -> ScopeId<'db> {
     // Scopes that may require type context are inferred during the inference of
     // their outer scope.
     if scope.accepts_type_context(db) {
